@@ -1,0 +1,760 @@
+!pip install -q gradio pandas openpyxl plotly
+# =========================================================
+# 📊 Modern Business Data Analyzer - Universal Version (Colab + Gradio)
+# - Accepts Excel / CSV / TXT
+# - If sales columns detected -> Business mode
+# - Else -> Generic mode (still shows high/low, charts)
+# =========================================================
+
+# !pip install -q gradio pandas openpyxl plotly
+
+import gradio as gr
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+import os
+
+# 🎨 Custom CSS
+custom_css = """
+body { background: radial-gradient(circle at top, #eef2ff 0, #ffffff 55%); }
+
+.header-fade {
+  animation: fadeInDown 0.7s ease-out;
+}
+.fade-in {
+  animation: fadeInUp 0.6s ease-out;
+}
+.card-hover {
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+.card-hover:hover {
+  transform: translateY(-4px) scale(1.01);
+  box-shadow: 0 12px 25px rgba(15, 23, 42, 0.18);
+}
+.glow-pulse {
+  animation: glowPulse 2s ease-in-out infinite;
+}
+
+@keyframes fadeInUp {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes fadeInDown {
+  from { opacity: 0; transform: translateY(-12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes glowPulse {
+  0%   { box-shadow: 0 0 0 rgba(129, 140, 248, 0.0); }
+  50%  { box-shadow: 0 0 25px rgba(129, 140, 248, 0.40); }
+  100% { box-shadow: 0 0 0 rgba(129, 140, 248, 0.0); }
+}
+"""
+
+# =========================================================
+# 1️⃣ Header Detection & Column Mapping Helpers
+# =========================================================
+
+CANONICAL_COLUMNS = {
+    "product_name": ["product", "item", "product name", "item name", "sku", "description", "name"],
+    "category": ["category", "group", "type", "segment"],
+    "quantity": ["qty", "quantity", "units", "volume", "pcs", "pieces"],
+    "unit_price": ["price", "rate", "unit price", "mrp", "selling price", "cost"],
+    "total_sale": ["total", "amount", "total sale", "line total", "revenue", "sales", "net"],
+    "date": ["date", "order date", "invoice date", "txn date"],
+    "region": ["region", "location", "area", "city", "state", "zone"]
+}
+
+def detect_header_row(df_raw: pd.DataFrame) -> int:
+    """
+    Detect the most likely header row using keyword scoring.
+    """
+    keywords = ["date", "product", "item", "qty", "quantity", "amount",
+                "total", "price", "category", "group", "type", "region",
+                "revenue", "sales", "name"]
+
+    best_row, best_score = 0, -1
+
+    for i, row in df_raw.iterrows():
+        score = 0
+        for cell in row:
+            if isinstance(cell, str):
+                cell_lower = cell.lower()
+                for kw in keywords:
+                    if kw in cell_lower:
+                        score += 1
+        if score > best_score:
+            best_score = score
+            best_row = i
+
+    return best_row
+
+def map_columns(columns):
+    """
+    Map messy column names to canonical names like product_name, category, etc.
+    """
+    mapping = {}
+    for col in columns:
+        col_clean = str(col).strip().lower()
+        mapped = None
+        for canonical, aliases in CANONICAL_COLUMNS.items():
+            for alias in aliases:
+                if alias in col_clean:
+                    mapped = canonical
+                    break
+            if mapped:
+                break
+        if mapped:
+            mapping[col] = mapped
+    return mapping
+
+def detect_label_value_columns(df: pd.DataFrame):
+    """
+    Detect a label column (categorical) and value column (numeric) for generic mode.
+    Priority:
+      - label: product_name if exists, else first non-numeric
+      - value: total_sale if exists, else first numeric
+    """
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    non_numeric_cols = df.select_dtypes(exclude=[np.number]).columns.tolist()
+
+    label_col = None
+    value_col = None
+
+    if "product_name" in df.columns:
+        label_col = "product_name"
+    elif non_numeric_cols:
+        label_col = non_numeric_cols[0]
+
+    if "total_sale" in df.columns:
+        value_col = "total_sale"
+    elif numeric_cols:
+        value_col = numeric_cols[0]
+
+    return label_col, value_col
+
+# =========================================================
+# 2️⃣ File Loading + Preprocessing
+# =========================================================
+
+def load_raw_table(file):
+    """
+    Load any supported tabular file (Excel / CSV / TXT) into a raw DataFrame with no header.
+    """
+    if file is None:
+        raise ValueError("No file provided")
+
+    path = file.name
+    ext = os.path.splitext(path)[1].lower()
+
+    if ext in [".xlsx", ".xls"]:
+        df_raw = pd.read_excel(path, header=None)
+        file_type = "excel"
+    elif ext == ".csv":
+        df_raw = pd.read_csv(path, header=None, sep=None, engine="python")
+        file_type = "csv"
+    elif ext == ".txt":
+        df_raw = pd.read_csv(path, header=None, sep=None, engine="python")
+        file_type = "text"
+    else:
+        raise ValueError(
+            f"Unsupported file type: {ext or 'unknown'}.\n"
+            "Supported types: .xlsx, .xls, .csv, .txt"
+        )
+
+    if df_raw.empty:
+        raise ValueError("The loaded file appears to be empty or not tabular.")
+
+    return df_raw, file_type
+
+def preprocess_table(file):
+    """
+    Load file, detect header row, apply column mapping, return cleaned df + mapping + header_index.
+    No 'required columns' error here; generic analysis will handle missing columns.
+    """
+    if file is None:
+        return None, None, None, "No file uploaded."
+
+    try:
+        df_raw, file_type = load_raw_table(file)
+    except Exception as e:
+        return None, None, None, f"Error loading file: {e}"
+
+    header_index = detect_header_row(df_raw)
+    path = file.name
+
+    try:
+        if file_type == "excel":
+            df = pd.read_excel(path, header=header_index)
+        else:
+            df = pd.read_csv(path, header=header_index, sep=None, engine="python")
+    except Exception as e:
+        return None, None, None, f"Error reading file with detected header: {e}"
+
+    # Drop completely empty columns
+    df = df.dropna(axis=1, how='all')
+
+    mapping = map_columns(df.columns)
+    df_renamed = df.rename(columns=mapping)
+
+    # Try to compute total_sale if missing but quantity + unit_price exist
+    if "total_sale" not in df_renamed.columns:
+        if "quantity" in df_renamed.columns and "unit_price" in df_renamed.columns:
+            try:
+                df_renamed["total_sale"] = pd.to_numeric(df_renamed["quantity"], errors="coerce") * \
+                                           pd.to_numeric(df_renamed["unit_price"], errors="coerce")
+            except Exception:
+                pass
+
+    # Convert numeric-like columns
+    for col in df_renamed.columns:
+        if df_renamed[col].dtype == object:
+            # Try numeric conversion where possible but don't force
+            converted = pd.to_numeric(df_renamed[col], errors="ignore")
+            df_renamed[col] = converted
+
+    if df_renamed.empty:
+        return df_renamed, mapping, header_index, "No valid rows after loading / cleaning."
+
+    return df_renamed, mapping, header_index, None
+
+# =========================================================
+# 3️⃣ KPI Calculations (Sales mode + Generic mode)
+# =========================================================
+
+def compute_kpis_sales(df: pd.DataFrame):
+    """
+    KPIs assuming proper sales columns (product_name + total_sale)
+    """
+    df = df.dropna(subset=["product_name", "total_sale"])
+    df["total_sale"] = pd.to_numeric(df["total_sale"], errors="coerce")
+    df = df.dropna(subset=["total_sale"])
+
+    total_revenue = df["total_sale"].sum()
+    total_rows = len(df)
+    unique_products = df["product_name"].nunique()
+    avg_order_value = total_revenue / total_rows if total_rows > 0 else 0
+
+    product_sales = df.groupby("product_name")["total_sale"].sum().reset_index()
+    product_sales = product_sales.sort_values(by="total_sale", ascending=True)
+
+    lowest_product = product_sales.iloc[0]
+    highest_product = product_sales.iloc[-1]
+
+    category_sales = None
+    best_category = None
+    if "category" in df.columns:
+        category_sales = df.groupby("category")["total_sale"].sum().reset_index()
+        category_sales = category_sales.sort_values(by="total_sale", ascending=False)
+        if not category_sales.empty:
+            best_category = category_sales.iloc[0]
+
+    return {
+        "mode": "sales",
+        "label_col": "product_name",
+        "value_col": "total_sale",
+        "total_revenue": total_revenue,
+        "total_rows": total_rows,
+        "unique_labels": unique_products,
+        "avg_value": avg_order_value,
+        "label_value": product_sales,
+        "lowest": lowest_product,
+        "highest": highest_product,
+        "category_sales": category_sales,
+        "best_category": best_category
+    }
+
+def compute_kpis_generic(df: pd.DataFrame):
+    """
+    KPIs when we don't have clear sales columns -> use detected label/value.
+    """
+    label_col, value_col = detect_label_value_columns(df)
+    total_rows = len(df)
+    num_cols = len(df.columns)
+
+    label_value = pd.DataFrame()
+    lowest = None
+    highest = None
+    total_value = None
+    avg_value = None
+    unique_labels = 0
+
+    if label_col and value_col:
+        tmp = df[[label_col, value_col]].copy()
+        tmp = tmp.dropna(subset=[label_col, value_col])
+        tmp[value_col] = pd.to_numeric(tmp[value_col], errors="coerce")
+        tmp = tmp.dropna(subset=[value_col])
+
+        if not tmp.empty:
+            label_value = tmp.groupby(label_col)[value_col].sum().reset_index()
+            label_value = label_value.sort_values(by=value_col, ascending=True)
+            lowest = label_value.iloc[0]
+            highest = label_value.iloc[-1]
+            total_value = label_value[value_col].sum()
+            avg_value = total_value / len(tmp) if len(tmp) > 0 else None
+            unique_labels = label_value[label_col].nunique()
+
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+
+    return {
+        "mode": "generic",
+        "label_col": label_col,
+        "value_col": value_col,
+        "total_rows": total_rows,
+        "num_cols": num_cols,
+        "numeric_cols": numeric_cols,
+        "total_value": total_value,
+        "avg_value": avg_value,
+        "unique_labels": unique_labels,
+        "label_value": label_value,
+        "lowest": lowest,
+        "highest": highest,
+        "category_sales": None,
+        "best_category": None
+    }
+
+# =========================================================
+# 4️⃣ HTML & Charts (Sales mode + Generic mode)
+# =========================================================
+
+def build_summary_html(df, mapping, header_index, kpis):
+    mode = kpis["mode"]
+    mapping_lines = "<br>".join([f"<strong>{src}</strong> → {dst}" for src, dst in mapping.items()]) or "No mapping detected."
+
+    if mode == "sales":
+        total = kpis["total_revenue"]
+        rows = kpis["total_rows"]
+        unique = kpis["unique_labels"]
+        avg = kpis["avg_value"]
+        lowest = kpis["lowest"]
+        highest = kpis["highest"]
+        best_category = kpis["best_category"]
+
+        best_cat_html = "Not available (no Category column detected)"
+        if best_category is not None:
+            best_cat_html = f"{best_category['category']} — {best_category['total_sale']:.2f}"
+
+        html = f"""
+<div class="fade-in">
+  <div class="card-hover" style="background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%); padding: 22px; border-radius: 16px; margin-bottom: 18px; color: white; text-align: center;">
+      <h2 style="margin: 0; font-size: 26px;">📊 Business Sales Analysis</h2>
+      <p style="margin-top: 6px; font-size: 14px;">Header row detected at index <strong>{header_index}</strong> • Columns auto-mapped for sales analysis</p>
+  </div>
+
+  <div class="card-hover" style="background: #ffffff; padding: 22px; border-radius: 14px; box-shadow: 0 4px 12px rgba(0,0,0,0.06); margin-bottom: 18px;">
+      <h3 style="color: #4f46e5; border-bottom: 3px solid #4f46e5; padding-bottom: 8px; margin-bottom: 14px;">🧩 Column Mapping</h3>
+      <p style="font-size: 13px; color: #4b5563; margin-bottom: 6px;">Detected columns and how they were interpreted:</p>
+      <div style="background:#f9fafb; padding:12px; border-radius:10px; font-size:13px; color:#111827; line-height:1.6;">
+        {mapping_lines}
+      </div>
+  </div>
+
+  <div class="card-hover glow-pulse" style="background: #ffffff; padding: 22px; border-radius: 14px; box-shadow: 0 4px 12px rgba(0,0,0,0.06); margin-bottom: 18px;">
+      <h3 style="color: #4f46e5; border-bottom: 3px solid #4f46e5; padding-bottom: 8px; margin-bottom: 14px;">📌 Key Sales Metrics</h3>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;">
+          <div style="background:#eef2ff;padding:14px;border-radius:12px;">
+              <div style="font-size:13px;color:#4338ca;">Total Revenue</div>
+              <div style="font-size:22px;font-weight:700;color:#111827;margin-top:4px;">₹ {total:,.2f}</div>
+          </div>
+          <div style="background:#f3f4f6;padding:14px;border-radius:12px;">
+              <div style="font-size:13px;color:#374151;">Total Records</div>
+              <div style="font-size:22px;font-weight:700;color:#111827;margin-top:4px;">{rows}</div>
+          </div>
+          <div style="background:#f3f4f6;padding:14px;border-radius:12px;">
+              <div style="font-size:13px;color:#374151;">Unique Products</div>
+              <div style="font-size:22px;font-weight:700;color:#111827;margin-top:4px;">{unique}</div>
+          </div>
+          <div style="background:#ecfdf5;padding:14px;border-radius:12px;">
+              <div style="font-size:13px;color:#047857;">Avg Order Value</div>
+              <div style="font-size:22px;font-weight:700;color:#111827;margin-top:4px;">₹ {avg:,.2f}</div>
+          </div>
+      </div>
+  </div>
+
+  <div class="card-hover" style="background:#ffffff;padding:22px;border-radius:14px;box-shadow:0 4px 12px rgba(0,0,0,0.06);">
+      <h3 style="color:#4f46e5;border-bottom:3px solid #4f46e5;padding-bottom:8px;margin-bottom:14px;">🏆 High & Low Selling Products</h3>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;">
+          <div style="background:#ecfdf5;padding:16px;border-radius:12px;border-left:5px solid #16a34a;">
+              <div style="font-size:13px;color:#166534;margin-bottom:4px;">Top Performer</div>
+              <div style="font-size:18px;font-weight:700;color:#111827;">{highest['product_name']}</div>
+              <div style="font-size:14px;color:#065f46;margin-top:6px;">Total Sales: ₹ {highest['total_sale']:,.2f}</div>
+          </div>
+          <div style="background:#fef2f2;padding:16px;border-radius:12px;border-left:5px solid #dc2626;">
+              <div style="font-size:13px;color:#991b1b;margin-bottom:4px;">Lowest Seller</div>
+              <div style="font-size:18px;font-weight:700;color:#111827;">{lowest['product_name']}</div>
+              <div style="font-size:14px;color:#7f1d1d;margin-top:6px;">Total Sales: ₹ {lowest['total_sale']:,.2f}</div>
+          </div>
+          <div style="background:#eff6ff;padding:16px;border-radius:12px;border-left:5px solid #3b82f6;">
+              <div style="font-size:13px;color:#1d4ed8;margin-bottom:4px;">Best Category</div>
+              <div style="font-size:16px;font-weight:700;color:#111827;">{best_cat_html}</div>
+              <div style="font-size:13px;color:#4b5563;margin-top:6px;">(Based on total revenue)</div>
+          </div>
+      </div>
+  </div>
+</div>
+"""
+        return html
+
+    # ---------- Generic mode ----------
+    rows = kpis["total_rows"]
+    num_cols = kpis["num_cols"]
+    label_col = kpis["label_col"]
+    value_col = kpis["value_col"]
+    total_value = kpis["total_value"]
+    avg_value = kpis["avg_value"]
+    unique_labels = kpis["unique_labels"]
+    lowest = kpis["lowest"]
+    highest = kpis["highest"]
+
+    label_name = label_col if label_col else "Not detected"
+    value_name = value_col if value_col else "Not detected"
+
+    if total_value is None:
+        total_value_text = "N/A"
+        avg_value_text = "N/A"
+    else:
+        total_value_text = f"{total_value:,.2f}"
+        avg_value_text = f"{avg_value:,.2f}" if avg_value is not None else "N/A"
+
+    high_low_html = ""
+    if lowest is not None and highest is not None:
+        high_low_html = f"""
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;">
+          <div style="background:#ecfdf5;padding:16px;border-radius:12px;border-left:5px solid #16a34a;">
+              <div style="font-size:13px;color:#166534;margin-bottom:4px;">Highest Value Item</div>
+              <div style="font-size:18px;font-weight:700;color:#111827;">{highest[label_col]}</div>
+              <div style="font-size:14px;color:#065f46;margin-top:6px;">{value_name}: {highest[value_col]:,.2f}</div>
+          </div>
+          <div style="background:#fef2f2;padding:16px;border-radius:12px;border-left:5px solid #dc2626;">
+              <div style="font-size:13px;color:#991b1b;margin-bottom:4px;">Lowest Value Item</div>
+              <div style="font-size:18px;font-weight:700;color:#111827;">{lowest[label_col]}</div>
+              <div style="font-size:14px;color:#7f1d1d;margin-top:6px;">{value_name}: {lowest[value_col]:,.2f}</div>
+          </div>
+      </div>
+        """
+    else:
+        high_low_html = """
+        <p style="font-size:13px;color:#6b7280;">Could not detect a label + numeric column combination to compute highest/lowest items.</p>
+        """
+
+    html = f"""
+<div class="fade-in">
+  <div class="card-hover" style="background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%); padding: 22px; border-radius: 16px; margin-bottom: 18px; color: white; text-align: center;">
+      <h2 style="margin: 0; font-size: 26px;">📊 Generic Data Analysis</h2>
+      <p style="margin-top: 6px; font-size: 14px;">Header row detected at index <strong>{header_index}</strong> • Auto-detected label/value columns for insight</p>
+  </div>
+
+  <div class="card-hover" style="background: #ffffff; padding: 22px; border-radius: 14px; box-shadow: 0 4px 12px rgba(0,0,0,0.06); margin-bottom: 18px;">
+      <h3 style="color: #4f46e5; border-bottom: 3px solid #4f46e5; padding-bottom: 8px; margin-bottom: 14px;">🧩 Column Mapping</h3>
+      <p style="font-size: 13px; color: #4b5563; margin-bottom: 6px;">Detected columns and interpretations (if any):</p>
+      <div style="background:#f9fafb; padding:12px; border-radius:10px; font-size:13px; color:#111827; line-height:1.6;">
+        {mapping_lines}
+      </div>
+  </div>
+
+  <div class="card-hover glow-pulse" style="background: #ffffff; padding: 22px; border-radius: 14px; box-shadow: 0 4px 12px rgba(0,0,0,0.06); margin-bottom: 18px;">
+      <h3 style="color: #4f46e5; border-bottom: 3px solid #4f46e5; padding-bottom: 8px; margin-bottom: 14px;">📌 Dataset Overview</h3>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;">
+          <div style="background:#eef2ff;padding:14px;border-radius:12px;">
+              <div style="font-size:13px;color:#4338ca;">Total Rows</div>
+              <div style="font-size:22px;font-weight:700;color:#111827;margin-top:4px;">{rows}</div>
+          </div>
+          <div style="background:#f3f4f6;padding:14px;border-radius:12px;">
+              <div style="font-size:13px;color:#374151;">Total Columns</div>
+              <div style="font-size:22px;font-weight:700;color:#111827;margin-top:4px;">{num_cols}</div>
+          </div>
+          <div style="background:#f3f4f6;padding:14px;border-radius:12px;">
+              <div style="font-size:13px;color:#374151;">Label Column</div>
+              <div style="font-size:16px;font-weight:600;color:#111827;margin-top:4px;">{label_name}</div>
+          </div>
+          <div style="background:#ecfdf5;padding:14px;border-radius:12px;">
+              <div style="font-size:13px;color:#047857;">Value Column</div>
+              <div style="font-size:16px;font-weight:600;color:#111827;margin-top:4px;">{value_name}</div>
+          </div>
+      </div>
+
+      <div style="margin-top:18px;display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;">
+          <div style="background:#f3f4f6;padding:14px;border-radius:12px;">
+              <div style="font-size:13px;color:#374151;">Sum of Value Column</div>
+              <div style="font-size:20px;font-weight:700;color:#111827;margin-top:4px;">{total_value_text}</div>
+          </div>
+          <div style="background:#f3f4f6;padding:14px;border-radius:12px;">
+              <div style="font-size:13px;color:#374151;">Average Value</div>
+              <div style="font-size:20px;font-weight:700;color:#111827;margin-top:4px;">{avg_value_text}</div>
+          </div>
+          <div style="background:#f3f4f6;padding:14px;border-radius:12px;">
+              <div style="font-size:13px;color:#374151;">Unique Labels</div>
+              <div style="font-size:20px;font-weight:700;color:#111827;margin-top:4px;">{unique_labels}</div>
+          </div>
+      </div>
+  </div>
+
+  <div class="card-hover" style="background:#ffffff;padding:22px;border-radius:14px;box-shadow:0 4px 12px rgba(0,0,0,0.06);">
+      <h3 style="color:#4f46e5;border-bottom:3px solid #4f46e5;padding-bottom:8px;margin-bottom:14px;">🏆 Highest & Lowest Items (Generic)</h3>
+      {high_low_html}
+  </div>
+</div>
+"""
+    return html
+
+def build_suggestions_html(kpis):
+    mode = kpis["mode"]
+    suggestions = []
+
+    if mode == "sales":
+        product_sales = kpis["label_value"]
+        category_sales = kpis["category_sales"]
+        total_revenue = kpis["total_revenue"]
+
+        if len(product_sales) >= 3 and total_revenue > 0:
+            top3 = product_sales.sort_values(by="total_sale", ascending=False).head(3)
+            top3_share = top3["total_sale"].sum() / total_revenue
+            if top3_share > 0.7:
+                suggestions.append(
+                    "Your top 3 products contribute more than 70% of total revenue. "
+                    "Double down on these with strong stock, promotions, and customer support."
+                )
+            elif top3_share < 0.4:
+                suggestions.append(
+                    "Revenue is spread across many products. This diversification reduces risk, "
+                    "but you can still highlight a few hero products with targeted marketing."
+                )
+
+        if category_sales is not None and not category_sales.empty and total_revenue > 0:
+            bottom_cat = category_sales.tail(1).iloc[0]
+            share = bottom_cat["total_sale"] / total_revenue
+            suggestions.append(
+                f"Category '{bottom_cat['category']}' has the lowest revenue share (~{share*100:.1f}%). "
+                "Review its product mix, pricing, and visibility."
+            )
+
+        if len(product_sales) > 5 and total_revenue > 0:
+            tail = product_sales.head(int(len(product_sales) * 0.2))
+            tail_share = tail["total_sale"].sum() / total_revenue
+            suggestions.append(
+                f"The bottom 20% of products contribute only ~{tail_share*100:.1f}% of revenue. "
+                "Consider discounts, bundles, or removing very weak items."
+            )
+
+    else:
+        # Generic dataset suggestions
+        label_col = kpis["label_col"]
+        value_col = kpis["value_col"]
+        if label_col and value_col:
+            suggestions.append(
+                f"Detected '{label_col}' as a label column and '{value_col}' as a numeric value column. "
+                "You can treat this as a simple ranking/score dataset."
+            )
+            suggestions.append(
+                "Items with highest values may represent top performers, highest scores, or largest amounts. "
+                "Use them to identify what is working best."
+            )
+            suggestions.append(
+                "Items with very low values may need special attention, cleanup, or could be outliers."
+            )
+        else:
+            suggestions.append(
+                "I couldn't confidently detect both a label and a numeric column. "
+                "Consider cleaning the dataset or renaming columns to clearer names like 'Product', 'Amount', 'Score', etc."
+            )
+
+    if not suggestions:
+        suggestions.append(
+            "Your data looks quite balanced. Focus on deeper analysis like trends over time, customer segments, or correlations."
+        )
+
+    sug_html = ""
+    for i, s in enumerate(suggestions, start=1):
+        sug_html += f"""
+        <div class="card-hover" style="background:#ffffff;padding:16px;border-radius:12px;margin-bottom:12px;border-left:4px solid #4f46e5;box-shadow:0 3px 10px rgba(0,0,0,0.04);">
+            <div style="font-size:14px;color:#4f46e5;font-weight:600;margin-bottom:6px;">Suggestion {i}</div>
+            <div style="font-size:14px;color:#111827;">{s}</div>
+        </div>
+        """
+
+    title = "💡 Business Insights & Suggestions" if mode == "sales" else "💡 Data Insights & Suggestions"
+
+    html = f"""
+<div class="fade-in">
+  <div class="card-hover" style="background: linear-gradient(135deg, #f97316 0%, #ec4899 100%); padding: 20px; border-radius: 15px; margin-bottom: 18px; text-align: center; color: white;">
+      <h2 style="margin: 0;">{title}</h2>
+      <p style="margin-top: 6px; font-size: 13px;">Quick observations generated from your uploaded data</p>
+  </div>
+  <div style="background:#f9fafb;padding:18px;border-radius:14px;box-shadow:0 4px 12px rgba(0,0,0,0.04);">
+      {sug_html}
+  </div>
+</div>
+"""
+    return html
+
+def build_pie_chart(kpis):
+    # For sales mode -> use category_sales; for generic -> use label_value (top N)
+    if kpis["mode"] == "sales":
+        category_sales = kpis["category_sales"]
+        if category_sales is None or category_sales.empty:
+            return go.Figure()
+        fig = go.Figure(
+            data=[go.Pie(
+                labels=category_sales["category"],
+                values=category_sales["total_sale"],
+                hole=0.3
+            )]
+        )
+        fig.update_layout(
+            title="Sales Distribution by Category",
+            height=400
+        )
+        return fig
+
+    # Generic mode
+    label_value = kpis["label_value"]
+    label_col = kpis["label_col"]
+    value_col = kpis["value_col"]
+    if label_value is None or label_value.empty or not label_col or not value_col:
+        return go.Figure()
+    top = label_value.sort_values(by=value_col, ascending=False).head(8)
+    fig = go.Figure(
+        data=[go.Pie(
+            labels=top[label_col],
+            values=top[value_col],
+            hole=0.3
+        )]
+    )
+    fig.update_layout(
+        title=f"Top {len(top)} {label_col} by {value_col}",
+        height=400
+    )
+    return fig
+
+def build_bar_chart(kpis, top_n=10):
+    label_value = kpis["label_value"]
+    label_col = kpis["label_col"]
+    value_col = kpis["value_col"]
+    if label_value is None or label_value.empty or not label_col or not value_col:
+        return go.Figure()
+
+    top = label_value.sort_values(by=value_col, ascending=False).head(top_n)
+
+    fig = go.Figure(
+        data=[go.Bar(
+            x=top[label_col],
+            y=top[value_col],
+        )]
+    )
+    fig.update_layout(
+        title=f"Top {min(top_n, len(top))} {label_col} by {value_col}",
+        xaxis_title=label_col,
+        yaxis_title=value_col,
+        height=430,
+        margin=dict(b=120)
+    )
+    fig.update_xaxes(tickangle=-45)
+    return fig
+
+# =========================================================
+# 5️⃣ Main Gradio Function
+# =========================================================
+
+def analyze_file(file):
+    if file is None:
+        error_html = """
+        <div class="fade-in card-hover" style="background:#fee2e2;padding:20px;border-radius:12px;color:#991b1b;text-align:center;">
+            <h3 style="margin:0 0 6px 0;">No file uploaded</h3>
+            <p style="margin:0;font-size:14px;">Please upload a data file (Excel / CSV / TXT).</p>
+        </div>
+        """
+        return error_html, "", "", None, None, pd.DataFrame()
+
+    df, mapping, header_index, error = preprocess_table(file)
+
+    if error is not None:
+        error_html = f"""
+        <div class="fade-in card-hover" style="background:#fee2e2;padding:20px;border-radius:12px;color:#991b1b;text-align:center;">
+            <h3 style="margin:0 0 6px 0;">⚠ Data Issue</h3>
+            <p style="margin:0;font-size:14px;white-space:pre-line;">{error}</p>
+        </div>
+        """
+        return error_html, "", "", None, None, pd.DataFrame()
+
+    # Decide mode: sales or generic
+    if "product_name" in df.columns and "total_sale" in df.columns:
+        kpis = compute_kpis_sales(df)
+    else:
+        kpis = compute_kpis_generic(df)
+
+    summary_html = build_summary_html(df, mapping, header_index, kpis)
+    suggestions_html = build_suggestions_html(kpis)
+    pie_chart = build_pie_chart(kpis)
+    bar_chart = build_bar_chart(kpis, top_n=10)
+
+    # Table for UI
+    label_value = kpis["label_value"]
+    if label_value is None or label_value.empty:
+        table = pd.DataFrame()
+    else:
+        table = label_value.copy()
+        table = table.rename(columns={kpis["label_col"]: "Label", kpis["value_col"]: "Value"})
+        table = table.sort_values(by="Value", ascending=False)
+
+    return summary_html, suggestions_html, "", pie_chart, bar_chart, table
+
+# =========================================================
+# 6️⃣ Gradio UI
+# =========================================================
+
+with gr.Blocks(theme=gr.themes.Soft(), css=custom_css, title="Business / Generic Data Analyzer") as demo:
+    gr.Markdown(
+        """
+        <div class="header-fade" style="text-align: center; margin-bottom: 10px;">
+            <h1 style="font-size: 32px; margin-bottom: 4px;">📊 Modern Data Analyzer</h1>
+            <p style="font-size: 15px; color: #4b5563;">
+                Upload any tabular file (Excel / CSV / TXT). The app auto-detects headers, 
+                tries to find product & sales info, and shows highest/lowest items with charts.
+            </p>
+        </div>
+        """
+    )
+
+    with gr.Row():
+        with gr.Column(scale=1):
+            data_file = gr.File(
+                label="📄 Upload Data File (Excel / CSV / TXT)",
+                file_types=None
+            )
+            analyze_btn = gr.Button("Analyze Data", variant="primary")
+
+        with gr.Column(scale=1):
+            pie_plot = gr.Plot(label="Pie Chart")
+            bar_plot = gr.Plot(label="Bar Chart (Top Items)")
+
+    with gr.Tab("📋 Summary & KPIs"):
+        summary_html = gr.HTML()
+
+    with gr.Tab("💡 Suggestions"):
+        suggestions_html = gr.HTML()
+
+    with gr.Tab("📊 Raw Notes"):
+        notes_html = gr.HTML(value="<p style='color:#6b7280;font-size:13px;'>Use this tab later for extra notes or export options.</p>")
+
+    with gr.Tab("📈 Detailed Table"):
+        product_table = gr.Dataframe(
+            interactive=False,
+            label="Label vs Value",
+        )
+
+    gr.Markdown(
+        """
+        <div class="fade-in" style="text-align: center; margin-top: 25px; padding: 10px 0; color: #6b7280; font-size: 13px;">
+            Built by <strong>Ajit babu kakumanu</strong>
+        </div>
+        """
+    )
+
+    analyze_btn.click(
+        fn=analyze_file,
+        inputs=[data_file],
+        outputs=[summary_html, suggestions_html, notes_html, pie_plot, bar_plot, product_table]
+    )
+
+if __name__ == "__main__":
+    # In Colab use:
+    demo.launch(share=True)
