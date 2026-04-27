@@ -168,6 +168,6 @@ Want to use this in your own project?
 You can reach out or connect with me here 👇
 
 📬 Contact
-💼 LinkedIn: Boddu Venkateswara Rao
+💼 LinkedIn: https://www.linkedin.com/in/venkateswara-rao-boddu-747474302
 
 📧 Email: venkateshboddu923@gmail.com
